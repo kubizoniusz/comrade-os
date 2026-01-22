@@ -4,19 +4,21 @@ set -e
 WORK="/tmp/comrade-build"
 ISO_OUT="ComradeOS-1.0.iso"
 
-# Funkcja czyszcząca w razie błędu
+# Funkcja sprzątająca
 cleanup() {
-    echo "Czyszczenie montowania..."
+    echo "Czyszczenie..."
     umount "$WORK/rootfs/dev/pts" 2>/dev/null || true
     umount "$WORK/rootfs/dev/shm" 2>/dev/null || true
     umount "$WORK/rootfs/dev" 2>/dev/null || true
     umount "$WORK/rootfs/sys" 2>/dev/null || true
     umount "$WORK/rootfs/proc" 2>/dev/null || true
+    # Usuwamy blokady i fałszywki
     rm -f "$WORK/rootfs/usr/sbin/policy-rc.d" 2>/dev/null || true
+    rm -f "$WORK/rootfs/usr/sbin/update-grub" 2>/dev/null || true
 }
 trap cleanup EXIT
 
-echo "★ COMRADE OS BUILDER (FINAL FIX) ★"
+echo "★ COMRADE OS BUILDER (BYPASS METHOD) ★"
 
 echo "[1/8] Instalacja pakietów hosta..."
 apk update
@@ -27,97 +29,84 @@ umount "$WORK/rootfs/proc" 2>/dev/null || true
 rm -rf "$WORK"
 mkdir -p "$WORK"/{rootfs,staging/live,staging/boot/grub}
 
-echo "[3/8] Pobieranie Debian minimal..."
-debootstrap --variant=minbase --arch=amd64 --include=python3,systemd,udev,nano,locales bookworm "$WORK/rootfs" http://deb.debian.org/debian
+echo "[3/8] Pobieranie systemu..."
+debootstrap --variant=minbase --arch=amd64 --include=python3,systemd,udev,nano bookworm "$WORK/rootfs" http://deb.debian.org/debian
 
-echo "[4/8] Instalacja skryptów Comrade OS..."
-# Tworzenie atrapy pliku python jeśli nie masz go pod ręką
+echo "[4/8] Skrypty Comrade OS..."
 if [ -f comrade_os.py ]; then
     cp comrade_os.py "$WORK/rootfs/usr/bin/comrade_os.py"
 else
-    echo "print('System ComradeOS uruchomiony pomyślnie.')" > "$WORK/rootfs/usr/bin/comrade_os.py"
+    echo "print('System ComradeOS OK')" > "$WORK/rootfs/usr/bin/comrade_os.py"
 fi
 chmod +x "$WORK/rootfs/usr/bin/comrade_os.py"
 
 cat << 'STARTSCRIPT' > "$WORK/rootfs/usr/bin/comrade-shell"
 #!/bin/bash
 clear
-echo "★ Uruchamianie Comrade OS... ★"
+echo "Startowanie Comrade OS..."
 sleep 1
 exec /usr/bin/python3 /usr/bin/comrade_os.py
 STARTSCRIPT
 chmod +x "$WORK/rootfs/usr/bin/comrade-shell"
 
-echo "[5/8] Konfiguracja autologowania..."
+# Autologin setup
 mkdir -p "$WORK/rootfs/etc/systemd/system/getty@tty1.service.d"
-cat << 'AUTOLOGIN' > "$WORK/rootfs/etc/systemd/system/getty@tty1.service.d/override.conf"
-[Service]
-ExecStart=
-ExecStart=-/usr/bin/comrade-shell
-StandardInput=tty
-StandardOutput=tty
-AUTOLOGIN
-
+printf "[Service]\nExecStart=\nExecStart=-/usr/bin/comrade-shell\nStandardInput=tty\nStandardOutput=tty\n" > "$WORK/rootfs/etc/systemd/system/getty@tty1.service.d/override.conf"
 echo "comrade-os" > "$WORK/rootfs/etc/hostname"
 
-echo "[6/8] Przygotowanie środowiska CHROOT..."
-
-# Montowanie
+echo "[5/8] Montowanie zasobów..."
 mount --bind /proc "$WORK/rootfs/proc"
 mount --bind /sys "$WORK/rootfs/sys"
 mount --bind /dev "$WORK/rootfs/dev"
-mount --bind /dev/pts "$WORK/rootfs/dev/pts" 2>/dev/null || true
-if [ -d /dev/shm ]; then mount --bind /dev/shm "$WORK/rootfs/dev/shm"; fi
+mount --bind /dev/pts "$WORK/rootfs/dev/pts"
+[ -d /dev/shm ] && mount --bind /dev/shm "$WORK/rootfs/dev/shm"
 
-# FIX 1: Blokada usług (policy-rc.d)
-cat << 'POLICY' > "$WORK/rootfs/usr/sbin/policy-rc.d"
-#!/bin/sh
-exit 101
-POLICY
+# FIX 1: Blokada usług
+printf "#!/bin/sh\nexit 101\n" > "$WORK/rootfs/usr/sbin/policy-rc.d"
 chmod +x "$WORK/rootfs/usr/sbin/policy-rc.d"
 
-# FIX 2: Naprawa /dev/fd (Kluczowe dla skryptów instalacyjnych kernela w chroot!)
-if [ ! -L "$WORK/rootfs/dev/fd" ]; then
-    ln -s /proc/self/fd "$WORK/rootfs/dev/fd" 2>/dev/null || true
-fi
+echo "[6/8] INSTALACJA KERNELA (METODA OSZUSTWA)..."
 
-echo "[7/8] Instalacja systemu (Dwuetapowa)..."
+# FIX 2: Oszukujemy instalator, że update-grub działa
+# Jeśli tego nie zrobimy, dpkg wywali błąd 1
+mv "$WORK/rootfs/usr/sbin/update-grub" "$WORK/rootfs/usr/sbin/update-grub.bak" 2>/dev/null || true
+ln -s /bin/true "$WORK/rootfs/usr/sbin/update-grub"
 
-# Etap A: Aktualizacja i narzędzia podstawowe
-echo ">>> Etap A: Podstawowe narzędzia..."
+# Instalacja podstaw (bez kernela)
 chroot "$WORK/rootfs" apt-get update
 DEBIAN_FRONTEND=noninteractive chroot "$WORK/rootfs" apt-get install -y --no-install-recommends \
-    initramfs-tools \
-    live-boot \
-    systemd-sysv \
-    kmod
+    initramfs-tools live-boot systemd-sysv
 
-# Etap B: Instalacja kernela (osobno, aby uniknąć dependency loop)
-echo ">>> Etap B: Instalacja Jądra Linux..."
-DEBIAN_FRONTEND=noninteractive chroot "$WORK/rootfs" apt-get install -y --no-install-recommends \
-    linux-image-amd64
+# Instalacja kernela (teraz update-grub zwróci "true" i dpkg nie zgłupieje)
+echo ">>> Instalowanie linux-image..."
+DEBIAN_FRONTEND=noninteractive chroot "$WORK/rootfs" apt-get install -y --no-install-recommends linux-image-amd64
 
-# Etap C: Naprawa ewentualnych błędów
-echo ">>> Etap C: Weryfikacja..."
-chroot "$WORK/rootfs" apt-get install -f -y
+# Przywracanie prawdziwego update-grub (jeśli istniał)
+rm "$WORK/rootfs/usr/sbin/update-grub"
+if [ -f "$WORK/rootfs/usr/sbin/update-grub.bak" ]; then
+    mv "$WORK/rootfs/usr/sbin/update-grub.bak" "$WORK/rootfs/usr/sbin/update-grub"
+fi
 
-# Sprzątanie blokady
-rm "$WORK/rootfs/usr/sbin/policy-rc.d"
+echo "[7/8] Ręczne generowanie Initrd..."
+# Ponieważ oszukaliśmy system przy instalacji, teraz musimy wymusić utworzenie pliku initrd
+KERNEL_VER=$(ls "$WORK/rootfs/lib/modules" | sort -V | tail -n 1)
+echo "Wykryta wersja kernela: $KERNEL_VER"
 
-# Odmontowanie
-cleanup
-
-echo "[8/8] Tworzenie ISO..."
-VMLINUZ=$(find "$WORK/rootfs/boot" -name "vmlinuz-*" | sort | tail -n 1)
-INITRD=$(find "$WORK/rootfs/boot" -name "initrd.img-*" | sort | tail -n 1)
-
-if [ -z "$VMLINUZ" ] || [ -z "$INITRD" ]; then
-    echo "BŁĄD KRYTYCZNY: Kernel nie został zainstalowany poprawnie. Sprawdź logi wyżej."
+if [ -z "$KERNEL_VER" ]; then
+    echo "BŁĄD: Nie znaleziono modułów kernela!"
     exit 1
 fi
 
-cp "$VMLINUZ" "$WORK/staging/live/vmlinuz"
-cp "$INITRD" "$WORK/staging/live/initrd"
+chroot "$WORK/rootfs" update-initramfs -c -k "$KERNEL_VER"
+
+# Sprzątanie blokady usług
+rm "$WORK/rootfs/usr/sbin/policy-rc.d"
+cleanup
+
+echo "[8/8] Pakowanie ISO..."
+# Kopiowanie vmlinuz i initrd
+cp "$WORK/rootfs/boot/vmlinuz-$KERNEL_VER" "$WORK/staging/live/vmlinuz"
+cp "$WORK/rootfs/boot/initrd.img-$KERNEL_VER" "$WORK/staging/live/initrd"
 
 mksquashfs "$WORK/rootfs" "$WORK/staging/live/filesystem.squashfs" -comp xz -no-recovery
 
@@ -134,4 +123,4 @@ grub-mkrescue -o "$ISO_OUT" "$WORK/staging"
 
 echo ""
 echo "★★★ SUKCES! ★★★"
-echo "Gotowy plik: $ISO_OUT"
+echo "Plik gotowy: $ISO_OUT"
