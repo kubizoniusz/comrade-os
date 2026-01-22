@@ -7,36 +7,36 @@ ISO_OUT="ComradeOS-1.0.iso"
 # Funkcja czyszcząca w razie błędu
 cleanup() {
     echo "Czyszczenie montowania..."
-    # Odmontowujemy w odwrotnej kolejności
     umount "$WORK/rootfs/dev/pts" 2>/dev/null || true
     umount "$WORK/rootfs/dev/shm" 2>/dev/null || true
     umount "$WORK/rootfs/dev" 2>/dev/null || true
     umount "$WORK/rootfs/sys" 2>/dev/null || true
     umount "$WORK/rootfs/proc" 2>/dev/null || true
-    
-    # Usuwamy blokadę usług jeśli została
     rm -f "$WORK/rootfs/usr/sbin/policy-rc.d" 2>/dev/null || true
 }
 trap cleanup EXIT
 
-echo "★ COMRADE OS BUILDER (FIXED) ★"
+echo "★ COMRADE OS BUILDER (FINAL FIX) ★"
 
-echo "[1/7] Instalacja pakietów hosta..."
+echo "[1/8] Instalacja pakietów hosta..."
 apk update
 apk add wget xorriso squashfs-tools grub grub-bios mtools debootstrap
 
-echo "[2/7] Przygotowanie katalogów..."
-# Ręczne czyszczenie przed startem (bez wywoływania trap)
+echo "[2/8] Przygotowanie katalogów..."
 umount "$WORK/rootfs/proc" 2>/dev/null || true
 rm -rf "$WORK"
 mkdir -p "$WORK"/{rootfs,staging/live,staging/boot/grub}
 
-echo "[3/7] Pobieranie Debian minimal..."
-# --no-check-gpg może być potrzebne w niektórych środowiskach Alpine
-debootstrap --variant=minbase --arch=amd64 --include=python3,systemd,udev,nano bookworm "$WORK/rootfs" http://deb.debian.org/debian
+echo "[3/8] Pobieranie Debian minimal..."
+debootstrap --variant=minbase --arch=amd64 --include=python3,systemd,udev,nano,locales bookworm "$WORK/rootfs" http://deb.debian.org/debian
 
-echo "[4/7] Instalacja skryptów Comrade OS..."
-cp comrade_os.py "$WORK/rootfs/usr/bin/comrade_os.py" 2>/dev/null || echo "print('Witaj w ComradeOS')" > "$WORK/rootfs/usr/bin/comrade_os.py"
+echo "[4/8] Instalacja skryptów Comrade OS..."
+# Tworzenie atrapy pliku python jeśli nie masz go pod ręką
+if [ -f comrade_os.py ]; then
+    cp comrade_os.py "$WORK/rootfs/usr/bin/comrade_os.py"
+else
+    echo "print('System ComradeOS uruchomiony pomyślnie.')" > "$WORK/rootfs/usr/bin/comrade_os.py"
+fi
 chmod +x "$WORK/rootfs/usr/bin/comrade_os.py"
 
 cat << 'STARTSCRIPT' > "$WORK/rootfs/usr/bin/comrade-shell"
@@ -44,16 +44,11 @@ cat << 'STARTSCRIPT' > "$WORK/rootfs/usr/bin/comrade-shell"
 clear
 echo "★ Uruchamianie Comrade OS... ★"
 sleep 1
-if [ -f /usr/bin/comrade_os.py ]; then
-    exec /usr/bin/python3 /usr/bin/comrade_os.py
-else
-    echo "Brak pliku comrade_os.py, uruchamiam bash."
-    exec /bin/bash
-fi
+exec /usr/bin/python3 /usr/bin/comrade_os.py
 STARTSCRIPT
 chmod +x "$WORK/rootfs/usr/bin/comrade-shell"
 
-echo "[5/7] Konfiguracja autologowania..."
+echo "[5/8] Konfiguracja autologowania..."
 mkdir -p "$WORK/rootfs/etc/systemd/system/getty@tty1.service.d"
 cat << 'AUTOLOGIN' > "$WORK/rootfs/etc/systemd/system/getty@tty1.service.d/override.conf"
 [Service]
@@ -65,58 +60,67 @@ AUTOLOGIN
 
 echo "comrade-os" > "$WORK/rootfs/etc/hostname"
 
-echo "[6/7] Instalacja kernela (NAPRAWIONA)..."
+echo "[6/8] Przygotowanie środowiska CHROOT..."
 
-# 1. Montowanie zasobów (ważne: shm i pts)
+# Montowanie
 mount --bind /proc "$WORK/rootfs/proc"
 mount --bind /sys "$WORK/rootfs/sys"
 mount --bind /dev "$WORK/rootfs/dev"
 mount --bind /dev/pts "$WORK/rootfs/dev/pts" 2>/dev/null || true
-# Czasami brak /dev/shm powoduje błędy w python/apt
 if [ -d /dev/shm ]; then mount --bind /dev/shm "$WORK/rootfs/dev/shm"; fi
 
-# 2. FIX: Blokada uruchamiania usług podczas instalacji (To naprawia błąd dpkg!)
+# FIX 1: Blokada usług (policy-rc.d)
 cat << 'POLICY' > "$WORK/rootfs/usr/sbin/policy-rc.d"
 #!/bin/sh
 exit 101
 POLICY
 chmod +x "$WORK/rootfs/usr/sbin/policy-rc.d"
 
-# 3. Instalacja w chroot
-echo "Aktualizacja repozytoriów..."
-chroot "$WORK/rootfs" apt-get update
+# FIX 2: Naprawa /dev/fd (Kluczowe dla skryptów instalacyjnych kernela w chroot!)
+if [ ! -L "$WORK/rootfs/dev/fd" ]; then
+    ln -s /proc/self/fd "$WORK/rootfs/dev/fd" 2>/dev/null || true
+fi
 
-echo "Instalacja jądra i narzędzi..."
-# Używamy --no-install-recommends, aby uniknąć instalowania zbędnych pakietów które mogą psuć (np. grub-pc wewnątrz chroot)
+echo "[7/8] Instalacja systemu (Dwuetapowa)..."
+
+# Etap A: Aktualizacja i narzędzia podstawowe
+echo ">>> Etap A: Podstawowe narzędzia..."
+chroot "$WORK/rootfs" apt-get update
 DEBIAN_FRONTEND=noninteractive chroot "$WORK/rootfs" apt-get install -y --no-install-recommends \
-    linux-image-amd64 \
+    initramfs-tools \
     live-boot \
     systemd-sysv \
-    initramfs-tools
+    kmod
 
-# 4. Sprzątanie blokady (bardzo ważne, inaczej system nie wstanie!)
+# Etap B: Instalacja kernela (osobno, aby uniknąć dependency loop)
+echo ">>> Etap B: Instalacja Jądra Linux..."
+DEBIAN_FRONTEND=noninteractive chroot "$WORK/rootfs" apt-get install -y --no-install-recommends \
+    linux-image-amd64
+
+# Etap C: Naprawa ewentualnych błędów
+echo ">>> Etap C: Weryfikacja..."
+chroot "$WORK/rootfs" apt-get install -f -y
+
+# Sprzątanie blokady
 rm "$WORK/rootfs/usr/sbin/policy-rc.d"
 
 # Odmontowanie
 cleanup
 
-echo "[7/7] Tworzenie ISO..."
-# Znajdź najnowszy kernel
+echo "[8/8] Tworzenie ISO..."
 VMLINUZ=$(find "$WORK/rootfs/boot" -name "vmlinuz-*" | sort | tail -n 1)
 INITRD=$(find "$WORK/rootfs/boot" -name "initrd.img-*" | sort | tail -n 1)
 
 if [ -z "$VMLINUZ" ] || [ -z "$INITRD" ]; then
-    echo "BŁĄD: Nie znaleziono kernela lub initrd w /boot!"
+    echo "BŁĄD KRYTYCZNY: Kernel nie został zainstalowany poprawnie. Sprawdź logi wyżej."
     exit 1
 fi
 
 cp "$VMLINUZ" "$WORK/staging/live/vmlinuz"
 cp "$INITRD" "$WORK/staging/live/initrd"
 
-echo "Pakowanie filesystem.squashfs..."
 mksquashfs "$WORK/rootfs" "$WORK/staging/live/filesystem.squashfs" -comp xz -no-recovery
 
-echo "Generowanie GRUB..."
 cat << 'GRUBCFG' > "$WORK/staging/boot/grub/grub.cfg"
 set default=0
 set timeout=3
@@ -129,5 +133,5 @@ GRUBCFG
 grub-mkrescue -o "$ISO_OUT" "$WORK/staging"
 
 echo ""
-echo "★★★ GOTOWE! ★★★"
-echo "Plik: $ISO_OUT"
+echo "★★★ SUKCES! ★★★"
+echo "Gotowy plik: $ISO_OUT"
